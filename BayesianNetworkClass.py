@@ -1,12 +1,15 @@
 import numpy as np
 from tqdm import tqdm
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from scipy.interpolate import RegularGridInterpolator
+from scipy.optimize import minimize
+from PlottingClass import *
+from SceneModelClass import SceneModelClass
 
 class BayesianNetworkClass:
-    def __init__(self,rcsCone,stdPertubation,stdProcessing,ACcenterList,numMCs):
+    def __init__(self,noiselessRCS,stdPertubation,stdProcessing,ACcenterList,numMCs):
         np.random.seed(413)
-        self.rcsCone = rcsCone
-        self.stdPerubtation = stdPertubation
+        self.noiselessRCS = noiselessRCS
+        self.stdPerturbation = stdPertubation
         self.stdProcessing  = stdProcessing
         self.numMCs         = numMCs
         self.aspectClassCenterList = ACcenterList
@@ -16,29 +19,34 @@ class BayesianNetworkClass:
         
 
     def trainNetwork(self):
-        minUnperturbed = np.min(self.rcsCone)
-        maxUnperturbed = np.max(self.rcsCone)
-        stdNoise = self.stdPerubtation + self.stdProcessing
+        minUnperturbed = np.min(self.noiselessRCS)
+        maxUnperturbed = np.max(self.noiselessRCS)
+        stdNoise = self.stdPerturbation + self.stdProcessing
         minVal = minUnperturbed - 3*stdNoise # extend up to 3 sigma
         maxVal = maxUnperturbed + 3*stdNoise
         self.rcsCenterList = np.arange(minVal,maxVal+1,1)
 
-
-        self.probFgivenAC = {accenter : {RCS : 0.0 for RCS in self.rcsCenterList} for accenter in self.aspectClassCenterList}
+        self.probFgivenACdiscrete = np.zeros((len(self.aspectClassCenterList),len(self.rcsCenterList)))
 
         for acIdx, acCenter in tqdm(enumerate(self.aspectClassCenterList)):
             for mc in range(self.numMCs):
-                unpeturbedRCS = self.rcsCone[acIdx]
+                unpeturbedRCS = self.noiselessRCS[acIdx]
                 noiseRCS = unpeturbedRCS + np.random.normal(0,stdNoise)
                 distances = np.abs(self.rcsCenterList - noiseRCS)
-                idxNeighbor = np.argmin(distances)
-                rcsKey = self.rcsCenterList[idxNeighbor]
-                self.probFgivenAC[acCenter][rcsKey] += 1/self.numMCs
+                idxRCSNeighbor = np.argmin(distances)
+                self.probFgivenACdiscrete[acIdx,idxRCSNeighbor] += 1/self.numMCs
 
+        #TODO - Do proper circular interpolation for edges!!
+        aspectStep = self.aspectClassCenterList[1] - self.aspectClassCenterList[0]
+        aspectClassCenterListCircular = np.concatenate(([self.aspectClassCenterList[0]-aspectStep],self.aspectClassCenterList,[self.aspectClassCenterList[-1] + aspectStep]))
+        probFgivenACdiscreteCircular = np.vstack((self.probFgivenACdiscrete[-1,:],self.probFgivenACdiscrete,self.probFgivenACdiscrete[0,:]))
+        self.proFgivenAlinearInterp = RegularGridInterpolator((aspectClassCenterListCircular,self.rcsCenterList),probFgivenACdiscreteCircular)
+
+        # PlottingClass.plotInterpProb(self.aspectClassCenterList,self.rcsCenterList,self.proFgivenAlinearInterp)
     
-    def computeOrientationMethod2(self,radarRCSdict,target):
+    def computeOrientationMethod1(self,radarRCSdict,target):
         
-        probXCgivenFlist = {xccenter: 0.0 for xccenter in self.orientationClassCentersList}
+        costFunctionList = {xccenter: 0.0 for xccenter in self.orientationClassCentersList}
 
         #Computer numerator
         for xccenter in self.orientationClassCentersList:
@@ -50,184 +58,117 @@ class BayesianNetworkClass:
                     if(pitch == -21.5 and yaw == 348.5):
                         None
 
-                    bpv = self.computeOrientationVector(pitch,yaw)
+                    bpv = SceneModelClass.computeOrientationVector(pitch,yaw)
                     if(txRadar == rxRadar):
-                        aspect = self.computeAspect(bpv,target,txRadar)
+                        aspect = SceneModelClass.computeAspectDegFromBpv(bpv,target,txRadar)
                     else:
-                        aspect = self.computeAspect(bpv,target,txRadar,rxRadar)
+                        aspect = SceneModelClass.computeAspectDegFromBpv(bpv,target,txRadar,rxRadar)
 
                     #Compute F class
                     Fdistances = np.abs(self.rcsCenterList - rcs)
                     idxFNeighbor = np.argmin(Fdistances)
-                    F = self.rcsCenterList[idxFNeighbor]
 
                     #Compute AC Class
                     ACdistances = np.abs(self.aspectClassCenterList - aspect)
                     idxACNeighbor = np.argmin(ACdistances)
-                    AC = self.aspectClassCenterList[idxACNeighbor]
-                   
-                    if(self.probFgivenAC[AC][F]>0):
-                        None
 
-                    pr_xccenter = np.append(pr_xccenter,self.probFgivenAC[AC][F])
+                    pr_xccenter = np.append(pr_xccenter,-np.log(self.probFgivenACdiscrete[idxACNeighbor,idxFNeighbor]))
+                    #pr_xccenter = np.append(pr_xccenter,-np.log(self.proFgivenA_spline((aspect,rcs)))))
 
-            pr_xccenter = np.append(pr_xccenter, 1/len(self.orientationClassCentersList))
-            probXCgivenFlist[xccenter] = np.prod(pr_xccenter)
+            costFunctionList[xccenter] = np.sum(pr_xccenter)
 
-        #Now we need to sum together all the elements in the dictionary to normalize
-        summand = 0.0
-        for unNoramlizedProb in probXCgivenFlist.values():
-            summand += unNoramlizedProb
-
-        for xccenter in probXCgivenFlist.keys():
-            probXCgivenFlist[xccenter] /= summand
-
-        likelyXC = max(probXCgivenFlist, key=probXCgivenFlist.get)
-
-        numMax = 0
-        maxProb = 0
-        for xccenter in probXCgivenFlist.keys():
-            if(maxProb < probXCgivenFlist[xccenter]):
-                maxProb = probXCgivenFlist[xccenter]
-                numMax = 1
-            elif(maxProb == probXCgivenFlist[xccenter]):
-                numMax += 1
-                
-        print(maxProb)
-        print(numMax)
+        likelyXC = min(costFunctionList, key=costFunctionList.get)
 
         return likelyXC
+
+    def computeOrientationMethod2(self,radarRCSdict,target):
+        #First get the RCS vector and pre compute
+        XCguessList = self.findProbableXCguesses(radarRCSdict,target)
+        minCost = float('inf')
+        pitchLikely = float('nan')
+        yawLikely   = float('nan')
+        print(len(XCguessList))
+        for xccenter in XCguessList:
+            pitch, yaw = xccenter
+            X_initial_guess = np.array([pitch,yaw])
+            results = minimize(self.method2Likelihood,X_initial_guess,args=(radarRCSdict,target),method='Powell')
+            if(results.fun < minCost):
+                minCost = results.fun
+                likelyX = results.x
+                pitchLikely = SceneModelClass.normalizePitch(likelyX[0])
+                yawLikely   = likelyX[1] % 360
+
+        return (pitchLikely,yawLikely)
     
-    def computeOrientationMethod2parallel(self,radarRCSdict,target):
+    def findProbableXCguesses(self,radarRCSdict,target):
+        minNXguess = 10
+        maxNXguess = 100
+        # initialThres = 0.04 #good for ideal
+        initialThres  = 0.06
+        thres = initialThres
+        step = 0.01
+        dir = 0
+        NXguessInRange = False
+        while(not NXguessInRange):
+            Xguess = []
+            for xccenter in self.orientationClassCentersList :
+                possibleXC = True
+                for txRadar in radarRCSdict.keys():
+                    for rxRadar in radarRCSdict[txRadar].keys():
+                        if not possibleXC:
+                            continue
+
+                        rcs = radarRCSdict[txRadar][rxRadar]
+                        pitch, yaw = xccenter
+                        bpv = SceneModelClass.computeOrientationVector(pitch,yaw)
+                        if(txRadar == rxRadar):
+                            aspect = SceneModelClass.computeAspectDegFromBpv(bpv,target,txRadar)
+                        else:
+                            aspect = SceneModelClass.computeAspectDegFromBpv(bpv,target,txRadar,rxRadar)
+
+                        # #Compute F class
+                        # Fdistances = np.abs(self.rcsCenterList - rcs)
+                        # idxFNeighbor = np.argmin(Fdistances)
+                        # F = self.rcsCenterList[idxFNeighbor]
+
+                        pr = self.proFgivenAlinearInterp((aspect,rcs))
+                        if(pr < thres):
+                            possibleXC = False
+                if possibleXC:
+                    Xguess.append(xccenter)
+            if(len(Xguess) > maxNXguess):
+                #we overshot and let in too many
+                if(dir == 1):
+                    step = step/2
+                    
+                thres = thres + step
+                dir = -1
+            elif(len(Xguess) < minNXguess):
+                if(dir == -1):
+                    step = step/2
+                thres = thres - step
+                dir = 1
+            else:
+                NXguessInRange = True
+
+        return Xguess
         
-        probXCgivenFlist = {xccenter: 0.0 for xccenter in self.orientationClassCentersList}
-
-        with ThreadPoolExecutor() as executor:
-            futures = [executor.submit(self.compute_for_xccenter,xccenter,radarRCSdict,target)
-                       for xccenter in self.orientationClassCentersList]
-            
-            for future in as_completed(futures):
-                xccenter, prob = future.result()
-                probXCgivenFlist[xccenter] = prob
-
-        likelyXC = max(probXCgivenFlist, key=probXCgivenFlist.get)
-
-        # numMax = 0
-        # maxProb = 0
-        # for xccenter in probXCgivenFlist.keys():
-        #     if(maxProb < probXCgivenFlist[xccenter]):
-        #         maxProb = probXCgivenFlist[xccenter]
-        #         numMax = 1
-        #     elif(maxProb == probXCgivenFlist[xccenter]):
-        #         numMax += 1
-                
-        # print(maxProb)
-        # print(numMax)
-
-        return likelyXC
     
-    @staticmethod
-    def compute_for_xccenter(self,xccenter, radarRCSdict, target):
-        pr_xccenter = np.array([])
+    def method2Likelihood(self, X, radarRCSdict, target):
+        Likelihood = 0
+        pitch = SceneModelClass.normalizePitch(X[0])
+        yaw   = X[1] % 360
+        bpv = SceneModelClass.computeOrientationVector(pitch,yaw)
         for txRadar in radarRCSdict.keys():
             for rxRadar in radarRCSdict[txRadar].keys():
-                rcs =  radarRCSdict[txRadar][rxRadar]
-                pitch, yaw = xccenter
-                if(pitch == -21.5 and yaw == 348.5):
-                    None
-
-                bpv = self.computeOrientationVector(pitch,yaw)
-                if(txRadar == rxRadar):
-                    aspect = self.computeAspect(bpv,target,txRadar)
+                rcs = radarRCSdict[txRadar][rxRadar]
+                if txRadar == rxRadar:
+                    aspect = SceneModelClass.computeAspectDegFromBpv(bpv, target, txRadar)
                 else:
-                    aspect = self.computeAspect(bpv,target,txRadar,rxRadar)
-
-                #Compute F class
-                Fdistances = np.abs(self.rcsCenterList - rcs)
-                idxFNeighbor = np.argmin(Fdistances)
-                F = self.rcsCenterList[idxFNeighbor]
-
-                #Compute AC Class
-                ACdistances = np.abs(self.aspectClassCenterList - aspect)
-                idxACNeighbor = np.argmin(ACdistances)
-                AC = self.aspectClassCenterList[idxACNeighbor]
-                
-                if(self.probFgivenAC[AC][F]>0):
-                    None
-
-                pr_xccenter = np.append(pr_xccenter,self.probFgivenAC[AC][F])
-
-        pr_xccenter = np.append(pr_xccenter, 1/len(self.orientationClassCentersList))
-        return xccenter, np.prod(pr_xccenter)
-
-    def computeOrientationVector(self,pitch,yaw):
-        pitchRad = np.deg2rad(pitch)
-        yawRad   = np.deg2rad(yaw)
-        return np.array([
-            np.cos(pitchRad)*np.cos(yawRad),
-            np.cos(pitchRad)*np.sin(yawRad),
-            -np.sin(pitchRad)
-        ])
-    
-    def computeAspect(self,bpvEstimate,target,*radar):
-        #TODO Add noise to target position
-        bpvEstimate
-        targetPos_m = np.array([target.pos.xm,target.pos.ym,target.pos.zm])
-        if(len(radar) == 1):
-            radarPos_m  = np.array([radar[0].xkm,radar[0].ykm,radar[0].zkm]) * 1e3
-            rlos = -(targetPos_m - radarPos_m) 
-            rlos = rlos / np.linalg.norm(rlos) #rlos = reverse line of sight vector
-        elif len(radar) == 2:
-            radarPos_m1  = np.array([radar[0].xkm,radar[0].ykm,radar[0].zkm]) * 1e3
-            rlos1 = -(targetPos_m - radarPos_m1) 
-            rlos1 = rlos1 / np.linalg.norm(rlos1) 
-
-            radarPos_m2  = np.array([radar[1].xkm,radar[1].ykm,radar[1].zkm]) * 1e3
-            rlos2 = -(targetPos_m - radarPos_m2) 
-            rlos2 = rlos2 / np.linalg.norm(rlos2) 
-
-            rlos = rlos1 + rlos2
-            rlos = rlos / np.linalg.norm(rlos)
-        else:
-            raise ValueError("Invalid number of RLOS arguments")
-        
-        cosa = np.dot(bpvEstimate,rlos)
-        arad = np.arccos(cosa)
-        adeg = np.rad2deg(arad)
-        return adeg 
-
-    # def computeAspect(self,XC,RLOS):
-    #     cosa = np.dot(XC,RLOS)
-    #     arad = np.acos(cosa)
-    #     AC   = np.rad2deg(arad)
-    #     return AC
-    
-    # def computeHalfAspect(self,XC,RLOS1,RLOS2):
-    #     RH = RLOS1 + RLOS2
-    #     RH = RH / np.linalg.norm(RH)
-    #     AC_H = self.computeAspect(XC,RH) 
-    #     return AC_H  
-
-    # def trainXCNewtorkGivenRLOS(self,*RLOS):
-    #     probFgivenXC = {xccenter : {RCS: 0.0 for RCS in self.rcsCenterList} for xccenter in self.orientationClassCentersList}      
-
-    #     for center in self.orientationClassCentersList:
-    #         pitch, yaw = center
-    #         XC = self.computeOrientationVector(pitch,yaw)
-    #         if(len(RLOS) == 1):
-    #             AC = self.computeAspect(XC,RLOS[0])
-    #         elif len(RLOS) == 2:
-    #             AC = self.computeHalfAspect(XC,RLOS[0],RLOS[1])
-    #         else:
-    #             raise ValueError("Invalid number of RLOS arguments")
-
-    #         ACdistances = np.abs(AC - self.aspectClassCenterList)
-    #         idxACNeighbor = np.argmin(ACdistances)
-    #         ACcenter = self.aspectClassCenterList[idxACNeighbor]
-    #         for rcsKey in self.rcsCenterList:
-    #             probFgivenXC[center][rcsKey] += self.probFgivenAC[ACcenter][rcsKey]
-
-    #     return probFgivenXC     
+                    aspect = SceneModelClass.computeAspectDegFromBpv(bpv, target, txRadar, rxRadar)
+                Likelihood -= np.log(self.proFgivenAlinearInterp((aspect, rcs)))   
+                #Likelihood -= np.log(self.testProbFgivenA(aspect,rcs))                 
+        return Likelihood
 
 
         
